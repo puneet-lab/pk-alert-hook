@@ -5,10 +5,10 @@ export default defineConfig({
   format: ['esm'],
   dts: true,
   clean: true,
-  sourcemap: true,
+  sourcemap: false,
   splitting: false,
   treeshake: true,
-  minify: false,
+  minify: true,
   outDir: 'dist',
   target: 'node18',
 });

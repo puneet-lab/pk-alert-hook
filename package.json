@@ -1,6 +1,6 @@
 {
   "name": "pk-alert-hook",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Lightweight runtime error alerting via Google Chat webhooks — instant notifications when your services break.",
   "type": "module",
   "sideEffects": false,
