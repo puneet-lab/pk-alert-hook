@@ -1,7 +1,14 @@
 interface RateLimitEntry {
   count: number;
+  pendingCount: number;
   firstSeen: number;
   lastSeen: number;
+  metadata?: unknown;
+}
+
+export interface FlushEntry {
+  count: number;
+  metadata?: unknown;
 }
 
 /**
@@ -9,6 +16,9 @@ interface RateLimitEntry {
  *
  * Groups identical errors (same fingerprint) within a time window.
  * Returns the accumulated count so the alert can show "occurred N times".
+ *
+ * Callers MUST call `confirmSend(fingerprint)` after successfully sending
+ * an alert so the limiter can track which occurrences were reported.
  */
 const MAX_ENTRIES = 1000;
 
@@ -26,42 +36,93 @@ export class RateLimiter {
    * Check if this fingerprint should be sent.
    * Returns `{ shouldSend: true, count }` if the window expired or first occurrence.
    * Returns `{ shouldSend: false }` if still within the dedup window.
+   *
+   * `metadata` is stored alongside the entry and returned by `flush()` so
+   * the caller can reconstruct a meaningful alert during graceful shutdown.
    */
-  check(fingerprint: string): { shouldSend: boolean; count: number } {
+  check(fingerprint: string, metadata?: unknown): { shouldSend: boolean; count: number } {
     const now = Date.now();
     const existing = this.entries.get(fingerprint);
 
     if (!existing) {
-      // Hard cap: evict oldest entry if at limit
+      // Hard cap: evict lowest-value entry if at limit
       if (this.entries.size >= MAX_ENTRIES) {
-        const oldestKey = this.entries.keys().next().value!;
-        this.entries.delete(oldestKey);
+        this.evictOne();
       }
-      this.entries.set(fingerprint, { count: 1, firstSeen: now, lastSeen: now });
+      this.entries.set(fingerprint, {
+        count: 1,
+        pendingCount: 1,
+        firstSeen: now,
+        lastSeen: now,
+        metadata,
+      });
       return { shouldSend: true, count: 1 };
     }
 
     const windowExpired = now - existing.firstSeen >= this.windowMs;
 
     if (windowExpired) {
-      const totalCount = existing.count + 1;
-      this.entries.set(fingerprint, { count: 1, firstSeen: now, lastSeen: now });
-      return { shouldSend: true, count: totalCount };
+      // pending from old window + 1 for the current trigger
+      const totalPending = existing.pendingCount + 1;
+      this.entries.set(fingerprint, {
+        count: 1,
+        pendingCount: 1,
+        firstSeen: now,
+        lastSeen: now,
+        metadata: metadata ?? existing.metadata,
+      });
+      return { shouldSend: true, count: totalPending };
     }
 
     existing.count++;
+    existing.pendingCount++;
     existing.lastSeen = now;
+    if (metadata !== undefined) existing.metadata = metadata;
     return { shouldSend: false, count: existing.count };
   }
 
-  /** Remove stale entries older than 2x the window */
+  /**
+   * Mark a fingerprint's pending count as reported.
+   * Call this AFTER the alert is actually queued for delivery.
+   */
+  confirmSend(fingerprint: string): void {
+    const entry = this.entries.get(fingerprint);
+    if (entry) entry.pendingCount = 0;
+  }
+
+  /**
+   * Evict one entry to make room. Prefers entries with no pending
+   * counts (already reported). Falls back to the entry with the
+   * lowest pending count to minimise data loss.
+   */
+  private evictOne(): void {
+    let targetKey: string | null = null;
+    let lowestPending = Infinity;
+
+    for (const [key, entry] of this.entries) {
+      if (entry.pendingCount === 0) {
+        targetKey = key;
+        break; // Best candidate — already fully reported
+      }
+      if (entry.pendingCount < lowestPending) {
+        lowestPending = entry.pendingCount;
+        targetKey = key;
+      }
+    }
+
+    if (targetKey) {
+      this.entries.delete(targetKey);
+    }
+  }
+
+  /** Remove stale entries older than 2x the window (only if fully reported) */
   private startCleanup(): void {
     this.cleanupTimer = setInterval(() => {
       const now = Date.now();
       const staleThreshold = this.windowMs * 2;
 
       for (const [key, entry] of this.entries) {
-        if (now - entry.lastSeen > staleThreshold) {
+        if (now - entry.lastSeen > staleThreshold && entry.pendingCount === 0) {
           this.entries.delete(key);
         }
       }
@@ -73,13 +134,13 @@ export class RateLimiter {
     }
   }
 
-  /** Flush all pending counts and return them for final send */
-  flush(): Map<string, number> {
-    const pending = new Map<string, number>();
+  /** Flush all entries with unreported counts, for graceful shutdown. */
+  flush(): Map<string, FlushEntry> {
+    const pending = new Map<string, FlushEntry>();
 
     for (const [key, entry] of this.entries) {
-      if (entry.count > 1) {
-        pending.set(key, entry.count);
+      if (entry.pendingCount > 0) {
+        pending.set(key, { count: entry.pendingCount, metadata: entry.metadata });
       }
     }
 

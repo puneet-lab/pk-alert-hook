@@ -1,7 +1,7 @@
 export { AlertHook } from './client.js';
 export { GoogleChatProvider } from './providers/google-chat.js';
 export { formatGoogleChatCard } from './formatter.js';
-export { RateLimiter } from './rate-limiter.js';
+export { RateLimiter, type FlushEntry } from './rate-limiter.js';
 
 export {
   Severity,

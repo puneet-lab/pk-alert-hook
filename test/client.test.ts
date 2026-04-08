@@ -221,11 +221,15 @@ describe('AlertHook', () => {
       AlertHook.capture(error);
       AlertHook.capture(error);
       AlertHook.capture(error);
-      await AlertHook.flush();
 
-      // Only first one should be sent
+      // Only first sent immediately — dedup suppresses the rest
       expect(provider.payloads).toHaveLength(1);
       expect(provider.payloads[0]!.occurrences).toBe(1);
+
+      // Flush drains the 2 suppressed as a summary
+      await AlertHook.flush();
+      expect(provider.payloads).toHaveLength(2);
+      expect(provider.payloads[1]!.occurrences).toBe(2);
     });
 
     it('allows different errors through', async () => {
@@ -238,6 +242,7 @@ describe('AlertHook', () => {
 
       expect(provider.payloads).toHaveLength(2);
     });
+
 
     it('sends all when rate limiting is disabled', async () => {
       const provider = createMockProvider();
@@ -252,6 +257,89 @@ describe('AlertHook', () => {
       AlertHook.capture(error);
       await AlertHook.flush();
 
+      expect(provider.payloads).toHaveLength(3);
+    });
+  });
+
+  // ─── Fingerprint normalization ─────────────────────────────────
+
+  describe('fingerprint normalization', () => {
+    it('deduplicates alerts that differ only by an incrementing counter', async () => {
+      const provider = createMockProvider();
+      AlertHook.initWithProvider(
+        { ...BASE_CONFIG, rateLimitWindowMs: 60_000 },
+        provider,
+      );
+
+      // Simulate noti-app SQS consumer: same error, counter increments each poll
+      AlertHook.alert('SQS poll failing repeatedly (2372 consecutive errors)');
+      AlertHook.alert('SQS poll failing repeatedly (2373 consecutive errors)');
+      AlertHook.alert('SQS poll failing repeatedly (2374 consecutive errors)');
+      AlertHook.alert('SQS poll failing repeatedly (2375 consecutive errors)');
+      AlertHook.alert('SQS poll failing repeatedly (2376 consecutive errors)');
+
+      // Only 1 sent immediately — NOT 5 (dedup works)
+      expect(provider.payloads).toHaveLength(1);
+
+      await AlertHook.flush();
+      // Flush adds summary of 4 suppressed
+      expect(provider.payloads).toHaveLength(2);
+    });
+
+    it('deduplicates errors that differ only by a UUID', async () => {
+      const provider = createMockProvider();
+      AlertHook.initWithProvider(
+        { ...BASE_CONFIG, rateLimitWindowMs: 60_000 },
+        provider,
+      );
+
+      AlertHook.alert('Failed to process message a1b2c3d4-e5f6-7890-abcd-ef1234567890');
+      AlertHook.alert('Failed to process message 11111111-2222-3333-4444-555555555555');
+      AlertHook.alert('Failed to process message deadbeef-cafe-babe-dead-beefcafebabe');
+
+      expect(provider.payloads).toHaveLength(1);
+
+      await AlertHook.flush();
+      expect(provider.payloads).toHaveLength(2);
+    });
+
+    it('deduplicates captured errors whose message contains dynamic numbers', async () => {
+      const provider = createMockProvider();
+      AlertHook.initWithProvider(
+        { ...BASE_CONFIG, rateLimitWindowMs: 60_000 },
+        provider,
+      );
+
+      // Errors with identical stack but message differs by a number
+      const makeError = (n: number) => {
+        const err = new Error(`Request timeout after ${n}ms`);
+        err.stack = `Error: Request timeout after ${n}ms\n    at fetch (/app/http.ts:42:5)`;
+        return err;
+      };
+
+      AlertHook.capture(makeError(3000));
+      AlertHook.capture(makeError(5000));
+      AlertHook.capture(makeError(12000));
+
+      expect(provider.payloads).toHaveLength(1);
+
+      await AlertHook.flush();
+      expect(provider.payloads).toHaveLength(2);
+    });
+
+    it('still distinguishes genuinely different errors', async () => {
+      const provider = createMockProvider();
+      AlertHook.initWithProvider(
+        { ...BASE_CONFIG, rateLimitWindowMs: 60_000 },
+        provider,
+      );
+
+      AlertHook.alert('SQS poll failing repeatedly (100 consecutive errors)');
+      AlertHook.alert('Database connection lost');
+      AlertHook.alert('Redis timeout on key lookup');
+      await AlertHook.flush();
+
+      // These are different errors — all three should be sent
       expect(provider.payloads).toHaveLength(3);
     });
   });

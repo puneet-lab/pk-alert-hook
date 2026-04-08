@@ -205,6 +205,21 @@ describe('formatGoogleChatCard', () => {
     expect(result.text).toBe('🔴 [PRODUCTION] test-app: Something went wrong');
   });
 
+  it('escapes HTML in text preview', () => {
+    const result = formatGoogleChatCard(
+      makePayload({
+        showPreviewText: true,
+        message: '<script>alert(1)</script>',
+        appName: '<b>evil</b>',
+      }),
+    );
+    const text = result.text as string;
+    expect(text).not.toContain('<script>');
+    expect(text).not.toContain('<b>evil');
+    expect(text).toContain('&lt;script&gt;');
+    expect(text).toContain('&lt;b&gt;');
+  });
+
   it('omits text preview when showPreviewText is false', () => {
     const result = formatGoogleChatCard(makePayload({ showPreviewText: false }));
     expect(result.text).toBeUndefined();

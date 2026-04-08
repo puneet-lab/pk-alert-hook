@@ -47,10 +47,12 @@ export class AlertHook {
    * Validates config with Zod — throws on invalid config.
    */
   static init(config: AlertHookConfig): void {
+    const oldPending = AlertHook.instance?.pendingPromises ?? [];
     AlertHook.instance?.rateLimiter?.destroy();
     const parsed = configSchema.parse(config);
     const provider = AlertHook.createProvider(parsed);
     AlertHook.instance = new AlertHook(parsed, provider);
+    AlertHook.instance.pendingPromises.push(...oldPending);
   }
 
   /**
@@ -58,9 +60,11 @@ export class AlertHook {
    * Skips provider-specific webhook URL validation — you own the provider.
    */
   static initWithProvider(config: AlertHookConfig, provider: AlertProvider): void {
+    const oldPending = AlertHook.instance?.pendingPromises ?? [];
     AlertHook.instance?.rateLimiter?.destroy();
     const parsed = baseConfigSchema.parse(config);
     AlertHook.instance = new AlertHook(parsed, provider);
+    AlertHook.instance.pendingPromises.push(...oldPending);
   }
 
   /**
@@ -127,12 +131,49 @@ export class AlertHook {
   }
 
   /**
-   * Await all pending alert sends. Call during graceful shutdown.
+   * Await all pending alert sends and flush suppressed counts.
+   * Call during graceful shutdown (e.g. SIGTERM).
    */
   static async flush(): Promise<void> {
     try {
       const instance = AlertHook.getInstance();
       if (!instance) return;
+
+      // Drain rate limiter — send summary alerts for suppressed errors
+      if (instance.rateLimiter) {
+        const pending = instance.rateLimiter.flush();
+        for (const [fingerprint, { count, metadata }] of pending) {
+          if (count > 0 && metadata) {
+            const { severity, message, stack } = metadata as {
+              severity: Severity;
+              message: string;
+              stack?: string;
+            };
+            const payload: AlertPayload = {
+              severity,
+              message,
+              stack: instance.truncateStack(stack),
+              context: {},
+              globalContext: { ...instance.globalContext },
+              appName: instance.config.appName,
+              environment: instance.config.environment,
+              version: instance.config.version,
+              timestamp: instance.formatTimestamp(),
+              fingerprint,
+              occurrences: count,
+              showPreviewText: instance.config.showPreviewText,
+            };
+
+            // Bypass canSend() — shutdown must drain everything
+            const promise = instance.provider.send(payload).catch((err) => {
+              if (!instance.config.silent) {
+                console.warn('[pk-alert-hook] Failed to send flush alert:', err);
+              }
+            });
+            instance.pendingPromises.push(promise);
+          }
+        }
+      }
 
       await Promise.allSettled(instance.pendingPromises);
       instance.pendingPromises = [];
@@ -260,10 +301,19 @@ export class AlertHook {
     return true;
   }
 
+  private static normalizeDynamicValues(text: string): string {
+    return text
+      .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '<uuid>')
+      .replace(/\d+/g, '<n>');
+  }
+
   private createFingerprint(message: string, stack?: string): string {
-    // Use message + first line of stack for dedup
+    // Normalize dynamic values (counters, UUIDs) so messages differing
+    // only by a number or id still share the same fingerprint.
+    const normalizedMessage = AlertHook.normalizeDynamicValues(message);
     const firstFrame = stack?.split('\n').find((line) => line.trim().startsWith('at ')) ?? '';
-    return `${message}::${firstFrame.trim()}`;
+    const normalizedFrame = AlertHook.normalizeDynamicValues(firstFrame.trim());
+    return `${normalizedMessage}::${normalizedFrame}`;
   }
 
   private sendAlert(
@@ -278,7 +328,7 @@ export class AlertHook {
 
     let occurrences = 1;
     if (this.rateLimiter) {
-      const result = this.rateLimiter.check(fingerprint);
+      const result = this.rateLimiter.check(fingerprint, { severity, message, stack });
       if (!result.shouldSend) return;
       occurrences = result.count;
     }
@@ -293,6 +343,9 @@ export class AlertHook {
       }
       return;
     }
+
+    // Mark as reported so flush() knows not to re-send
+    this.rateLimiter?.confirmSend(fingerprint);
 
     const payload: AlertPayload = {
       severity,

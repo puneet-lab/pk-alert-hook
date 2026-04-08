@@ -54,14 +54,16 @@ describe('RateLimiter', () => {
     limiter = new RateLimiter(60_000);
 
     limiter.check('err-1');
+    limiter.confirmSend('err-1'); // first was sent
     limiter.check('err-1');
     limiter.check('err-1');
     limiter.check('err-2');
+    limiter.confirmSend('err-2'); // first was sent
 
     const pending = limiter.flush();
 
-    expect(pending.get('err-1')).toBe(3);
-    expect(pending.has('err-2')).toBe(false); // count 1, not pending
+    expect(pending.get('err-1')?.count).toBe(2); // 2 suppressed
+    expect(pending.has('err-2')).toBe(false); // fully reported
     expect(limiter.size).toBe(0);
   });
 

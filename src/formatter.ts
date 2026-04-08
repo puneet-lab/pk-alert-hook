@@ -69,11 +69,11 @@ export function formatGoogleChatCard(payload: AlertPayload): Record<string, unkn
     });
   }
 
-  // ── Context section (user context + global context, no duplication) ──
-  const mergedContext = { ...payload.globalContext, ...payload.context };
-  const contextEntries = Object.entries(mergedContext).filter(
-    ([, v]) => v !== undefined && v !== null,
-  );
+  // ── Context section (global context + call context, both preserved) ──
+  const contextEntries = [
+    ...Object.entries(payload.globalContext),
+    ...Object.entries(payload.context),
+  ].filter(([, v]) => v !== undefined && v !== null);
 
   if (contextEntries.length > 0) {
     sections.push({
@@ -124,7 +124,7 @@ export function formatGoogleChatCard(payload: AlertPayload): Record<string, unkn
   // When enabled, adds a text preview above the card.
   // Shows in desktop/mobile notifications. Displays as a separate line in chat.
   if (payload.showPreviewText) {
-    result.text = `${icon} [${payload.environment.toUpperCase()}] ${payload.appName}: ${payload.message}`;
+    result.text = `${icon} [${escapeHtml(payload.environment.toUpperCase())}] ${escapeHtml(payload.appName)}: ${escapeHtml(payload.message)}`;
   }
 
   return result;
